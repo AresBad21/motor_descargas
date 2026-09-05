@@ -18,7 +18,10 @@ def extraer_enlace(url: str):
     if not url:
         raise HTTPException(status_code=400, detail="Debes proporcionar una URL")
     
-    ydl_opts = {'quiet': True, 'nocheckcertificate': True}
+    ydl_opts = {
+        'quiet': True, 
+        'nocheckcertificate': True
+    }
     
     try:
         with yt_dlp.YoutubeDL(ydl_opts) as ydl:
@@ -47,7 +50,14 @@ def extraer_enlace(url: str):
                 for f in formatos_ordenados:
                     vcodec = f.get('vcodec', 'none')
                     acodec = f.get('acodec', 'none')
+                    proto = f.get('protocol', '')
+                    enlace_fmt = f.get('url', '')
                     
+                    # Descartamos listas de fragmentos DASH o M3U8 que corrompen el archivo local
+                    if 'm3u8' in proto or 'dash' in proto or '.mpd' in enlace_fmt:
+                        continue
+                    
+                    # Exigimos video y audio juntos en una sola URL progresiva
                     if vcodec != 'none' and acodec != 'none':
                         alto = f.get('height')
                         if alto:
@@ -63,19 +73,22 @@ def extraer_enlace(url: str):
                             
                             formatos_filtrados.append({
                                 "etiqueta": etiqueta, 
-                                "url": f.get('url'), 
+                                "url": enlace_fmt, 
                                 "ext": f.get('ext', 'mp4'),
                                 "peso": calcular_peso(peso_bytes)
                             })
 
+            # Respaldo si no hay formatos combinados limpios
             if not formatos_filtrados and info.get('url'):
-                peso_bytes = info.get('filesize') or info.get('filesize_approx')
-                formatos_filtrados.append({
-                    "etiqueta": "Calidad Máxima Disponible", 
-                    "url": info.get('url'), 
-                    "ext": info.get('ext', 'mp4'),
-                    "peso": calcular_peso(peso_bytes)
-                })
+                proto_directo = info.get('protocol', '')
+                if 'm3u8' not in proto_directo and 'dash' not in proto_directo:
+                    peso_bytes = info.get('filesize') or info.get('filesize_approx')
+                    formatos_filtrados.append({
+                        "etiqueta": "Calidad Estándar Compatible", 
+                        "url": info.get('url'), 
+                        "ext": info.get('ext', 'mp4'),
+                        "peso": calcular_peso(peso_bytes)
+                    })
             
             resultados = []
             vistos = set()
@@ -85,7 +98,7 @@ def extraer_enlace(url: str):
                     resultados.append(f)
 
             if not resultados:
-                raise HTTPException(status_code=404, detail="No se encontraron formatos.")
+                raise HTTPException(status_code=404, detail="No se encontraron formatos de video compatibles para descarga directa.")
                 
             return {
                 "exito": True,
@@ -95,4 +108,3 @@ def extraer_enlace(url: str):
             
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
-      
