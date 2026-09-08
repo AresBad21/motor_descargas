@@ -1,21 +1,15 @@
 import os
+import re
 import shutil
 import uuid
 from pathlib import Path
-from datetime import datetime, timedelta
+from urllib.parse import urlparse
 
+import yt_dlp
 from fastapi import FastAPI, HTTPException
 from fastapi.responses import FileResponse
-from starlette.background import BackgroundTask
-import yt_dlp
 
-
-app = FastAPI(
-    title="Motor de Descargas Ultra",
-    version="2.0.0",
-)
-
-# Render usará esta URL pública. No se usa la IP de la PC.
+APP_NAME = "Motor de Descargas Ultra"
 PUBLIC_BASE_URL = os.getenv(
     "PUBLIC_BASE_URL",
     "https://motor-descargas.onrender.com",
@@ -24,41 +18,74 @@ PUBLIC_BASE_URL = os.getenv(
 DOWNLOAD_DIR = Path("downloads")
 DOWNLOAD_DIR.mkdir(parents=True, exist_ok=True)
 
-# Los videos son temporales: se eliminan después de entregarlos al celular.
-TEMP_FILE_TTL_MINUTES = 30
+# Render Free tiene almacenamiento efímero: los archivos se conservan poco tiempo.
+TEMP_FILE_TTL_MINUTES = int(os.getenv("TEMP_FILE_TTL_MINUTES", "20"))
 
-IMAGE_EXTENSIONS = {"jpg", "jpeg", "png", "webp", "gif", "bmp", "avif"}
+# 0 = sin límite. La prioridad es máxima calidad disponible.
+MAX_HEIGHT = int(os.getenv("MAX_HEIGHT", "0"))
 
+IMAGE_EXTENSIONS = {
+    "jpg", "jpeg", "png", "webp", "gif", "bmp", "avif"
+}
 
-def calcular_peso(ruta_archivo: Path) -> str:
-    try:
-        size = ruta_archivo.stat().st_size
-    except (FileNotFoundError, OSError):
-        return "Desconocido"
+BROWSER_USER_AGENT = os.getenv(
+    "BROWSER_USER_AGENT",
+    "Mozilla/5.0 (Linux; Android 13; Pixel 7) "
+    "AppleWebKit/537.36 (KHTML, like Gecko) "
+    "Chrome/131.0.0.0 Mobile Safari/537.36",
+)
 
-    return f"{size / (1024 * 1024):.2f} MB"
+app = FastAPI(
+    title=APP_NAME,
+    version="3.0.0",
+)
 
 
 def limpiar_temporales_antiguos() -> None:
-    """Evita que el almacenamiento temporal de Render se llene."""
-    limite = datetime.now().timestamp() - (TEMP_FILE_TTL_MINUTES * 60)
+    limite = __import__("time").time() - TEMP_FILE_TTL_MINUTES * 60
 
-    for archivo in DOWNLOAD_DIR.glob("*.mp4"):
+    for archivo in DOWNLOAD_DIR.iterdir():
         try:
-            if archivo.stat().st_mtime < limite:
+            if archivo.is_file() and archivo.stat().st_mtime < limite:
                 archivo.unlink(missing_ok=True)
         except OSError:
             pass
 
 
-def eliminar_archivo(ruta: Path) -> None:
+def calcular_peso(ruta: Path) -> str:
     try:
-        ruta.unlink(missing_ok=True)
-    except OSError:
-        pass
+        return f"{ruta.stat().st_size / (1024 * 1024):.2f} MB"
+    except (OSError, FileNotFoundError):
+        return "Desconocido"
 
 
-def obtener_extension_imagen(info: dict) -> str:
+def titulo_seguro(valor: str | None) -> str:
+    texto = (valor or "archivo_descargado").strip()
+    texto = re.sub(r"[\x00-\x1f\\/:*?\"<>|]+", "_", texto)
+    texto = re.sub(r"\s+", " ", texto).strip(" ._")
+    return (texto or "archivo_descargado")[:100]
+
+
+def es_manifest(url: str) -> bool:
+    path = str(url or "").lower().split("?", 1)[0]
+    return path.endswith(".m3u8") or path.endswith(".mpd")
+
+
+def es_imagen(info: dict) -> bool:
+    ext = str(info.get("ext") or "").lower()
+    if ext in IMAGE_EXTENSIONS:
+        return True
+
+    if str(info.get("video_ext") or "").lower() in {"", "none"}:
+        vcodec = str(info.get("vcodec") or "").lower()
+        acodec = str(info.get("acodec") or "").lower()
+        if vcodec in {"", "none"} and acodec in {"", "none"}:
+            return bool(info.get("url") or info.get("thumbnails"))
+
+    return False
+
+
+def extension_imagen(info: dict) -> str:
     ext = str(
         info.get("ext")
         or info.get("image_ext")
@@ -69,35 +96,214 @@ def obtener_extension_imagen(info: dict) -> str:
     if ext in IMAGE_EXTENSIONS:
         return ext
 
-    url = str(info.get("url") or "").lower()
-    for posible in IMAGE_EXTENSIONS:
-        if f".{posible}" in url:
-            return posible
+    direct = str(info.get("url") or "").lower()
+    for candidate in IMAGE_EXTENSIONS:
+        if f".{candidate}" in direct:
+            return candidate
 
     return "jpg"
 
 
-def parece_imagen(info: dict) -> bool:
-    ext = str(info.get("ext") or "").lower()
-    if ext in IMAGE_EXTENSIONS:
-        return True
+def navegador_headers(url_fuente: str, info: dict | None = None) -> dict:
+    headers = {
+        "User-Agent": BROWSER_USER_AGENT,
+        "Accept-Language": "es-419,es;q=0.9,en;q=0.8",
+    }
 
-    video_ext = str(info.get("video_ext") or "").lower()
-    if not video_ext and info.get("vcodec") in (None, "none"):
-        # Algunos extractores entregan publicaciones de una sola imagen
-        # sin un formato de vídeo.
-        return bool(info.get("url") and not info.get("formats"))
+    raw = (info or {}).get("http_headers") or {}
+    for key, value in raw.items():
+        if key.lower() in {
+            "user-agent",
+            "referer",
+            "accept",
+            "accept-language",
+        } and value:
+            headers[key] = str(value)
 
-    return False
+    host = urlparse(url_fuente).netloc.lower()
+    if "instagram." in host:
+        headers.setdefault("Referer", "https://www.instagram.com/")
+    elif "facebook." in host or host.startswith("fb."):
+        headers.setdefault("Referer", "https://www.facebook.com/")
+    else:
+        headers.setdefault(
+            "Referer",
+            f"{urlparse(url_fuente).scheme}://{urlparse(url_fuente).netloc}/",
+        )
+
+    return headers
 
 
-def titulo_seguro(titulo: str) -> str:
-    limpio = "".join(
-        caracter if caracter.isalnum() or caracter in " -_()." else "_"
-        for caracter in titulo
+def opciones_ytdlp(url_fuente: str, output: str | None = None) -> dict:
+    opts = {
+        "quiet": True,
+        "no_warnings": True,
+        "noplaylist": True,
+        "nocheckcertificate": True,
+        "retries": 4,
+        "fragment_retries": 4,
+        "file_access_retries": 4,
+        "socket_timeout": 40,
+        "http_headers": navegador_headers(url_fuente),
+        "geo_bypass": True,
+    }
+
+    if output:
+        opts["outtmpl"] = output
+
+    return opts
+
+
+def clasificar_error(exc: Exception) -> tuple[int, str]:
+    texto = str(exc).strip()
+    t = texto.lower()
+
+    if any(x in t for x in (
+        "private", "login required", "sign in", "members only",
+        "authentication required", "age-restricted",
+    )):
+        return 403, "El contenido es privado, restringido o requiere iniciar sesión."
+
+    if any(x in t for x in (
+        "video unavailable", "not available", "removed", "deleted",
+        "does not exist", "page not found",
+    )):
+        return 404, "El contenido no existe, fue eliminado o ya no está disponible."
+
+    if any(x in t for x in (
+        "unsupported url", "no suitable extractor",
+    )):
+        return 422, "El enlace o la plataforma no son compatibles con yt-dlp."
+
+    if "ffmpeg" in t or "postprocess" in t or "merger" in t:
+        return 422, "El servidor no pudo fusionar las pistas multimedia con FFmpeg."
+
+    return 500, f"No se pudo procesar el enlace: {texto or 'error desconocido'}"
+
+
+def seleccionar_directo(info: dict) -> dict | None:
+    """
+    Devuelve solo un formato HTTP progresivo con vídeo + audio.
+    Nunca devuelve HLS/DASH ni una pista de vídeo sin audio.
+    """
+    formatos = info.get("formats") or []
+
+    candidatos: list[dict] = []
+
+    for fmt in formatos:
+        protocol = str(fmt.get("protocol") or "").lower()
+        direct_url = str(fmt.get("url") or "")
+        vcodec = str(fmt.get("vcodec") or "none").lower()
+        acodec = str(fmt.get("acodec") or "none").lower()
+
+        if protocol not in {"http", "https"}:
+            continue
+        if not direct_url or es_manifest(direct_url):
+            continue
+        if vcodec in {"", "none"} or acodec in {"", "none"}:
+            continue
+
+        height = int(fmt.get("height") or 0)
+        if MAX_HEIGHT > 0 and height > MAX_HEIGHT:
+            continue
+
+        candidatos.append(fmt)
+
+    if not candidatos:
+        # Algunos extractores entregan un único formato fuera de formats[].
+        direct_url = str(info.get("url") or "")
+        protocol = str(info.get("protocol") or "").lower()
+        vcodec = str(info.get("vcodec") or "none").lower()
+        acodec = str(info.get("acodec") or "none").lower()
+
+        if (
+            direct_url
+            and not es_manifest(direct_url)
+            and protocol in {"http", "https"}
+            and vcodec not in {"", "none"}
+            and acodec not in {"", "none"}
+        ):
+            return info
+
+        return None
+
+    candidatos.sort(
+        key=lambda f: (
+            int(f.get("height") or 0),
+            float(f.get("fps") or 0),
+            float(f.get("tbr") or 0),
+            int(f.get("filesize") or f.get("filesize_approx") or 0),
+        ),
+        reverse=True,
     )
-    limpio = " ".join(limpio.split()).strip(" ._")
-    return (limpio or "video_descargado")[:80]
+    return candidatos[0]
+
+
+def buscar_archivo(file_id: str) -> Path | None:
+    archivos = sorted(
+        DOWNLOAD_DIR.glob(f"video_{file_id}.*"),
+        key=lambda p: p.stat().st_mtime,
+        reverse=True,
+    )
+    for archivo in archivos:
+        try:
+            if archivo.is_file() and archivo.stat().st_size > 0:
+                return archivo
+        except OSError:
+            pass
+    return None
+
+
+def descargar_video_y_fusionar(url_fuente: str, file_id: str) -> Path:
+    if not shutil.which("ffmpeg"):
+        raise HTTPException(
+            status_code=422,
+            detail="FFmpeg no está instalado o no está disponible en Render.",
+        )
+
+    output_template = str(DOWNLOAD_DIR / f"video_{file_id}.%(ext)s")
+
+    if MAX_HEIGHT > 0:
+        selector = (
+            f"bestvideo[height<={MAX_HEIGHT}]+bestaudio/"
+            f"best[height<={MAX_HEIGHT}]/best"
+        )
+    else:
+        selector = "bestvideo+bestaudio/best"
+
+    opts = opciones_ytdlp(url_fuente, output_template)
+    opts.update({
+        "format": selector,
+        "merge_output_format": "mp4",
+        "format_sort": "res,fps,br,filesize",
+        "postprocessors": [
+            {
+                "key": "FFmpegVideoConvertor",
+                "preferedformat": "mp4",
+            }
+        ],
+    })
+
+    try:
+        with yt_dlp.YoutubeDL(opts) as ydl:
+            ydl.extract_info(url_fuente, download=True)
+    except Exception as exc:
+        status, message = clasificar_error(exc)
+        raise HTTPException(status_code=status, detail=message) from exc
+
+    archivo = buscar_archivo(file_id)
+    if archivo is None:
+        raise HTTPException(
+            status_code=422,
+            detail="yt-dlp terminó sin producir un archivo de vídeo válido.",
+        )
+
+    # Si por alguna razón quedó otro contenedor, intentamos localizar MP4.
+    mp4 = DOWNLOAD_DIR / f"video_{file_id}.mp4"
+    if mp4.exists() and mp4.stat().st_size > 0:
+        return mp4
+
+    return archivo
 
 
 @app.get("/")
@@ -106,25 +312,23 @@ def inicio():
         "ok": True,
         "mensaje": "Motor de Descargas Ultra activo.",
         "servidor": PUBLIC_BASE_URL,
+        "version_api": "3.0.0",
     }
 
 
 @app.get("/health")
 def health():
-    ffmpeg = shutil.which("ffmpeg")
-    ffprobe = shutil.which("ffprobe")
-
     return {
         "ok": True,
-        "yt_dlp": True,
-        "ffmpeg": ffmpeg or "no encontrado",
-        "ffprobe": ffprobe or "no encontrado",
+        "yt_dlp": yt_dlp.version.__version__,
+        "ffmpeg": shutil.which("ffmpeg") or "no encontrado",
+        "ffprobe": shutil.which("ffprobe") or "no encontrado",
     }
 
 
 @app.get("/extraer")
 def extraer_contenido(url: str):
-    url = url.strip()
+    url = (url or "").strip()
 
     if not url:
         raise HTTPException(
@@ -132,41 +336,38 @@ def extraer_contenido(url: str):
             detail="Debes proporcionar una URL.",
         )
 
-    if not url.lower().startswith(("http://", "https://")):
+    parsed = urlparse(url)
+    if parsed.scheme.lower() not in {"http", "https"} or not parsed.netloc:
         raise HTTPException(
             status_code=400,
-            detail="La URL debe comenzar con http:// o https://.",
+            detail="La URL debe comenzar con http:// o https:// y ser válida.",
         )
 
     limpiar_temporales_antiguos()
 
     file_id = uuid.uuid4().hex
-    output_template = str(DOWNLOAD_DIR / f"video_{file_id}.%(ext)s")
-
-    # Primera pasada: solo analiza el enlace.
-    # Así una imagen no se descarga inútilmente al servidor.
-    extract_opts = {
-        "quiet": True,
-        "no_warnings": True,
-        "noplaylist": True,
-        "nocheckcertificate": True,
-        "skip_download": True,
-    }
+    outtmpl = str(DOWNLOAD_DIR / f"video_{file_id}.%(ext)s")
 
     try:
+        # PASO 1: análisis. Importante: no asumimos que info["formats"] exista.
+        extract_opts = opciones_ytdlp(url)
+        extract_opts["skip_download"] = True
+
         with yt_dlp.YoutubeDL(extract_opts) as ydl:
             info = ydl.extract_info(url, download=False)
 
         if not info:
             raise HTTPException(
                 status_code=422,
-                detail="No se pudo obtener información del enlace.",
+                detail="yt-dlp no pudo obtener información de este enlace.",
             )
 
-        # Algunas publicaciones pueden venir como playlist/entries.
-        # Para una app de un solo enlace, usamos el primer elemento.
+        # Un post con varias entradas: usamos la primera descargable.
         if info.get("_type") in {"playlist", "multi_video"}:
-            entries = [entrada for entrada in (info.get("entries") or []) if entrada]
+            entries = [
+                item for item in (info.get("entries") or [])
+                if item
+            ]
             if not entries:
                 raise HTTPException(
                     status_code=422,
@@ -174,133 +375,182 @@ def extraer_contenido(url: str):
                 )
             info = entries[0]
 
-        titulo = titulo_seguro(str(info.get("title") or "archivo_descargado"))
+        titulo = titulo_seguro(info.get("title"))
 
-        if parece_imagen(info):
-            url_imagen = info.get("url")
+        # ---------------------------------------------------------------
+        # IMAGEN
+        # ---------------------------------------------------------------
+        if es_imagen(info):
+            url_imagen = str(info.get("url") or "")
 
-            if not url_imagen and info.get("thumbnails"):
-                thumbnails = info.get("thumbnails") or []
-                for thumbnail in reversed(thumbnails):
-                    if thumbnail and thumbnail.get("url"):
-                        url_imagen = thumbnail["url"]
+            if not url_imagen or es_manifest(url_imagen):
+                for thumb in reversed(info.get("thumbnails") or []):
+                    candidate = str((thumb or {}).get("url") or "")
+                    if candidate and not es_manifest(candidate):
+                        url_imagen = candidate
                         break
 
             if not url_imagen:
                 raise HTTPException(
                     status_code=422,
-                    detail="Se detectó una imagen, pero no se obtuvo su URL directa.",
+                    detail="Se detectó una imagen, pero no se obtuvo una URL utilizable.",
                 )
+
+            ext = extension_imagen(info)
+            headers = navegador_headers(url, info)
+
+            # Compatibilidad con el cliente nuevo y el cliente antiguo.
+            formato_imagen = {
+                "etiqueta": "Imagen original",
+                "ext": ext,
+                "peso": "Desconocido",
+                "url": url_imagen,
+                "altura": info.get("height"),
+                "ancho": info.get("width"),
+            }
 
             return {
                 "exito": True,
                 "es_foto": True,
+                "modo": "directo",
                 "titulo": titulo,
-                "extension": obtener_extension_imagen(info),
+                "extension": ext,
                 "url_directa": url_imagen,
+                "headers": headers,
+                "formatos": [formato_imagen],
             }
 
-        # Selección: máxima calidad disponible de vídeo + mejor audio.
-        # No limitamos a 1080p: si el sitio ofrece 1440p/4K/8K,
-        # yt-dlp puede elegirlo. FFmpeg se encarga de muxearlo a MP4.
-        ydl_opts = {
-            "format": "bestvideo+bestaudio/best",
-            "merge_output_format": "mp4",
-            "outtmpl": output_template,
-            "quiet": True,
-            "no_warnings": True,
-            "noplaylist": True,
-            "nocheckcertificate": True,
-            "retries": 3,
-            "fragment_retries": 3,
-            "file_access_retries": 3,
-            "format_sort": "res,fps,br,filesize",
-        }
+        # ---------------------------------------------------------------
+        # VÍDEO DIRECTO CON AUDIO
+        # ---------------------------------------------------------------
+        directo = seleccionar_directo(info)
 
-        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-            info_descarga = ydl.extract_info(url, download=True)
+        if directo:
+            direct_url = str(directo.get("url") or "")
+            headers = navegador_headers(url, {
+                "http_headers": directo.get("http_headers") or info.get("http_headers") or {}
+            })
 
-        posibles = sorted(
-            DOWNLOAD_DIR.glob(f"video_{file_id}.*"),
-            key=lambda p: p.stat().st_mtime,
-            reverse=True,
-        )
-
-        if not posibles:
-            raise HTTPException(
-                status_code=500,
-                detail=(
-                    "FFmpeg/yt-dlp no generó el archivo final. "
-                    "Comprueba que FFmpeg esté instalado en Render."
-                ),
+            filesize = (
+                directo.get("filesize")
+                or directo.get("filesize_approx")
+            )
+            peso = (
+                f"{int(filesize) / (1024 * 1024):.2f} MB"
+                if filesize
+                else "Desconocido"
             )
 
-        ruta_final = posibles[0]
+            formato = {
+                "id": str(directo.get("format_id") or "direct"),
+                "etiqueta": (
+                    f"Máxima calidad ({directo.get('height')}p)"
+                    if directo.get("height")
+                    else "Máxima calidad"
+                ),
+                "ext": "mp4",
+                "peso": peso,
+                "url": direct_url,
+                "altura": directo.get("height"),
+                "ancho": directo.get("width"),
+                "fps": directo.get("fps"),
+                "has_audio": True,
+            }
 
-        # El resultado final debe ser MP4 para que el teléfono lo reproduzca
-        # fácilmente después del mux de vídeo + audio.
-        if ruta_final.suffix.lower() != ".mp4":
-            candidato_mp4 = ruta_final.with_suffix(".mp4")
-            if candidato_mp4.exists():
-                ruta_final = candidato_mp4
+            return {
+                "exito": True,
+                "es_foto": False,
+                "modo": "directo",
+                "titulo": titulo,
+                "peso": peso,
+                "extension": "mp4",
+                "calidad_maxima": {
+                    "altura": directo.get("height"),
+                    "ancho": directo.get("width"),
+                    "fps": directo.get("fps"),
+                },
+                "url_directa": direct_url,
+                "headers": headers,
+                # Compatibilidad con la versión antigua de Flutter.
+                "formatos": [formato],
+            }
 
-        nombre_archivo = ruta_final.name
-        peso = calcular_peso(ruta_final)
+        # ---------------------------------------------------------------
+        # VÍDEO ADAPTATIVO: vídeo + audio separados
+        # ---------------------------------------------------------------
+        # Aquí NO devolvemos "no se encontraron formatos".
+        # Descargamos ambos flujos en Render y FFmpeg produce un MP4 con audio.
+        archivo = descargar_video_y_fusionar(url, file_id)
+        peso = calcular_peso(archivo)
+
+        info_final = {
+            "altura": info.get("height"),
+            "ancho": info.get("width"),
+            "fps": info.get("fps"),
+        }
+
+        url_servidor = f"{PUBLIC_BASE_URL}/descargar_archivo/{archivo.name}"
+
+        formato_servidor = {
+            "id": "server-max",
+            "etiqueta": (
+                f"Máxima calidad ({info_final['altura']}p)"
+                if info_final["altura"]
+                else "Máxima calidad + audio"
+            ),
+            "ext": "mp4",
+            "peso": peso,
+            "url": url_servidor,
+            "altura": info_final["altura"],
+            "ancho": info_final["ancho"],
+            "fps": info_final["fps"],
+            "has_audio": True,
+        }
 
         return {
             "exito": True,
             "es_foto": False,
-            "titulo": str(
-                info_descarga.get("title")
-                or info.get("title")
-                or "video_descargado"
-            ),
+            "modo": "servidor",
+            "titulo": titulo,
             "peso": peso,
-            "calidad_maxima": {
-                "altura": info_descarga.get("height") or info.get("height"),
-                "ancho": info_descarga.get("width") or info.get("width"),
-                "fps": info_descarga.get("fps") or info.get("fps"),
-            },
-            "url_descarga": (
-                f"{PUBLIC_BASE_URL}/descargar_archivo/{nombre_archivo}"
-            ),
+            "extension": "mp4",
+            "calidad_maxima": info_final,
+            "url_descarga": url_servidor,
+            # Compatibilidad con el cliente antiguo.
+            "formatos": [formato_servidor],
         }
 
     except HTTPException:
         raise
     except Exception as exc:
-        raise HTTPException(
-            status_code=500,
-            detail=f"No se pudo procesar el enlace: {exc}",
-        ) from exc
+        status, message = clasificar_error(exc)
+        raise HTTPException(status_code=status, detail=message) from exc
 
 
 @app.get("/descargar_archivo/{nombre_archivo}")
 def servir_archivo(nombre_archivo: str):
-    # Impide que un nombre recibido por la URL salga de DOWNLOAD_DIR.
-    nombre_seguro = Path(nombre_archivo).name
+    seguro = Path(nombre_archivo).name
 
-    if nombre_seguro != nombre_archivo or not nombre_seguro.startswith("video_"):
+    if seguro != nombre_archivo or not seguro.startswith("video_"):
         raise HTTPException(
             status_code=400,
             detail="Nombre de archivo no válido.",
         )
 
-    ruta = DOWNLOAD_DIR / nombre_seguro
+    ruta = DOWNLOAD_DIR / seguro
 
     if not ruta.is_file():
         raise HTTPException(
             status_code=404,
-            detail="El video ya no se encuentra en el servidor.",
+            detail="El archivo ya no se encuentra en el servidor.",
         )
 
     return FileResponse(
         path=str(ruta),
         media_type="video/mp4",
-        filename=nombre_seguro,
-        background=BackgroundTask(eliminar_archivo, ruta),
+        filename=seguro,
         headers={
             "Cache-Control": "no-store",
-            "Content-Disposition": f'attachment; filename="{nombre_seguro}"',
+            "Content-Disposition": f'attachment; filename="{seguro}"',
         },
     )
